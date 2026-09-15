@@ -25,8 +25,12 @@ import requests
 from bs4 import BeautifulSoup
 import json
 import os
+import re
 import time
-from datetime import datetime
+import calendar
+from datetime import datetime, timezone, timedelta
+
+KST = timezone(timedelta(hours=9))  # 한국 시간 기준
 
 # ==================== 설정 ====================
 KEYWORDS = ["펩트론", "비만"]
@@ -62,13 +66,47 @@ def send_telegram(message):
         print(f"[텔레그램 전송 실패] {e}")
 
 
+def is_today_kst(dt_utc):
+    """UTC 시간을 한국 시간으로 바꿔서 오늘 날짜인지 확인"""
+    dt_kst = dt_utc.astimezone(KST)
+    now_kst = datetime.now(KST)
+    return dt_kst.date() == now_kst.date()
+
+
 def fetch_google_news(keyword):
     url = f"https://news.google.com/rss/search?q={keyword}&hl=ko&gl=KR&ceid=KR:ko"
     feed = feedparser.parse(url)
     results = []
     for entry in feed.entries[:15]:
+        # 기사 작성 시각을 확인해서 오늘 기사가 아니면 건너뜀
+        if getattr(entry, "published_parsed", None):
+            pub_dt = datetime.fromtimestamp(
+                calendar.timegm(entry.published_parsed), tz=timezone.utc
+            )
+            if not is_today_kst(pub_dt):
+                continue
         results.append({"title": entry.title, "link": entry.link, "source": "구글뉴스"})
     return results
+
+
+def is_naver_time_today(time_text):
+    """네이버 검색결과에 뜨는 '3시간 전', '2일 전', '2026.09.15.' 같은 표시로 오늘 기사인지 판단"""
+    text = time_text.strip()
+    if not text:
+        return True  # 시간 표시가 없으면 일단 포함 (아래 로직에서 걸러지지 않도록)
+
+    # '2026.09.15.' 처럼 절대 날짜로 표시되는 경우
+    date_match = re.match(r"(\d{4})\.(\d{2})\.(\d{2})", text)
+    if date_match:
+        today_str = datetime.now(KST).strftime("%Y.%m.%d")
+        return text.startswith(today_str)
+
+    # '3일 전', '2주 전', '1개월 전', '1년 전' -> 오늘 기사 아님
+    if any(unit in text for unit in ["일 전", "주 전", "개월 전", "년 전"]):
+        return False
+
+    # '방금', 'N분 전', 'N시간 전' -> 오늘 기사로 간주
+    return True
 
 
 def fetch_naver_news(keyword):
@@ -78,11 +116,21 @@ def fetch_naver_news(keyword):
     try:
         res = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(res.text, "html.parser")
-        for a in soup.select("a.news_tit"):
+        for area in soup.select("div.news_area"):
+            a = area.select_one("a.news_tit")
+            if not a:
+                continue
             title = a.get("title") or a.text
             link = a.get("href")
-            if link:
-                results.append({"title": title, "link": link, "source": "네이버뉴스"})
+            if not link:
+                continue
+
+            info_spans = area.select("span.info")
+            time_text = info_spans[-1].get_text(strip=True) if info_spans else ""
+            if not is_naver_time_today(time_text):
+                continue
+
+            results.append({"title": title, "link": link, "source": "네이버뉴스"})
     except Exception as e:
         print(f"[네이버 뉴스 가져오기 실패] {e}")
     return results
